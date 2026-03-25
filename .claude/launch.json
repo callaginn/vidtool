@@ -1,0 +1,14 @@
+{
+	"version": "0.0.1",
+	"configurations": [
+		{
+			"name": "uploader",
+			"runtimeExecutable": "/bin/sh",
+			"runtimeArgs": [
+				"-c",
+				"cd www && php -d upload_max_filesize=64M -d post_max_size=64M -d max_execution_time=300 -S localhost:8234"
+			],
+			"port": 8234
+		}
+	]
+}

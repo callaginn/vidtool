@@ -1,0 +1,7 @@
+{
+    "name": "vidtool/vidtool",
+    "description": "A video conversion tool for the web",
+    "scripts": {
+        "serve": "php -S localhost:8000 -t www -d max_execution_time=0"
+    }
+}

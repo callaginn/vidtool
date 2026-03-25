@@ -1,0 +1,13 @@
+# EditorConfig is awesome: https://EditorConfig.org
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_size = 4
+indent_style = tab
+insert_final_newline = true
+max_line_length = off
+
+[yarn.lock]
+indent_style = tab
+indent_size = 4
