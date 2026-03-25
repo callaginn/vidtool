@@ -1,7 +1,10 @@
 {
-    "name": "vidtool/vidtool",
-    "description": "A video conversion tool for the web",
-    "scripts": {
-        "serve": "php -S localhost:8000 -t www -d max_execution_time=0"
-    }
+	"name": "vidtool/vidtool",
+	"description": "A video conversion tool for the web",
+	"config": {
+		"process-timeout": 0
+	},
+	"scripts": {
+		"serve": "bash serve.sh"
+	}
 }

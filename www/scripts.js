@@ -1,507 +1,584 @@
-document.addEventListener('DOMContentLoaded', function() {
-	if (window.Prism && Prism.highlightAll) {
-		Prism.highlightAll();
+class VidTool {
+	static PARSE_RULES = [
+		[/^\s*title\s*:\s*(.+)/, 'input',
+			(s, m) => { s.title = m[1].trim(); }],
+		[/^\s*artist\s*:\s*(.+)/, 'input',
+			(s, m) => { s.artist = m[1].trim(); }],
+		[/Duration:\s*([\d:.]+)/, 'input',
+			(s, m) => { s.duration = m[1]; }],
+		[/Stream #0:\d+.*Video:\s*(\w+).*?,\s*\w+.*?,\s*(\d+)x(\d+).*?,\s*([\d.]+)\s*fps/,
+			'input', (s, m) => {
+				s.codec = m[1];
+				s.resolution = `${m[2]}x${m[3]}`;
+				s.fps = m[4];
+			}],
+		[/Output #\d+,\s*(\w+),\s*to\s+'.*?\/([\w.]+)'/,
+			'outputs', (s, m) => {
+				const raw = m[1].toUpperCase();
+				const name = m[2];
+				const ext = name.split('.').pop().toUpperCase();
+				const fmt = ext || raw;
+				if (!s.outputs.find(o => o.name === name))
+					s.outputs.push({ fmt, rawFmt: raw, name });
+			}],
+		[/\[out#\d+\/(\w+)\s.*?video:\s*(\d+)KiB/, null, (s, m) => {
+			const fmt = m[1].toUpperCase();
+			const kb = parseInt(m[2], 10);
+			const size = kb >= 1024
+				? `${(kb / 1024).toFixed(1)} MB`
+				: `${kb} KB`;
+			s.outputSizes.push({ fmt, size });
+		}],
+		[/^speed=([\d.]+)x/, 'encoding',
+			(s, m) => { s.speed = m[1] + 'x'; }],
+		[/^out_time=([\d:.]+)/, 'encoding', (s, m) => {
+			if (m[1] === 'N/A') return;
+			const pos = m[1].replace(/\.\d+$/, '');
+			s.outTime = s.duration ? `${pos} / ${s.duration}` : pos;
+		}],
+		[/Total processing time:\s*([\d.]+)s/, null,
+			(s, m) => { s.totalTime = m[1]; }],
+	];
+	
+	constructor() {
+		this.el = this.#buildEls();
+		this.summary = {};
+		this.view = 'summary';
+		this.hlPending = false;
+		this.duration = 0;
+		this.#resetSummary();
+		this.#bind();
+		if (window.Prism && Prism.highlightAll) Prism.highlightAll();
 	}
-});
-
-const form = document.getElementById('videoForm');
-const mainCard = document.getElementById('mainCard');
-const logDiv = document.querySelector('#log code');
-const logPre = document.getElementById('log');
-const progressWrapper = document.getElementById('progressWrapper');
-const progressBar = document.getElementById('progressBar');
-const progressText = document.getElementById('progressText');
-const downloadLinks = document.getElementById('downloadLinks');
-const submitBtn = document.getElementById('submitBtn');
-const logsToggle = document.getElementById('logsToggle');
-const logsToggleText = document.getElementById('logsToggleText');
-const dropZone = document.getElementById('dropZone');
-const fileInput = document.getElementById('file');
-const fileInfo = document.getElementById('fileInfo');
-const fileName = document.getElementById('fileName');
-const fileSize = document.getElementById('fileSize');
-const clearFile = document.getElementById('clearFile');
-
-// Summary panel elements
-const sumInput = document.getElementById('sumInput');
-const sumTitle = document.getElementById('sumTitle');
-const sumArtist = document.getElementById('sumArtist');
-const sumChips = document.getElementById('sumChips');
-const sumOutputs = document.getElementById('sumOutputs');
-const sumOutputList = document.getElementById('sumOutputList');
-const sumEncoding = document.getElementById('sumEncoding');
-const sumSpeed = document.getElementById('sumSpeed');
-const sumPosition = document.getElementById('sumPosition');
-const sumResults = document.getElementById('sumResults');
-const sumBarChart = document.getElementById('sumBarChart');
-const sumComplete = document.getElementById('sumComplete');
-const sumTotalTime = document.getElementById('sumTotalTime');
-const viewToggle = document.getElementById('viewToggle');
-
-// Summary state
-let summary = {};
-let currentView = 'summary';
-function resetSummary() {
-	summary = { title: '', artist: '', duration: '', durationSec: 0, resolution: '', codec: '', fps: '', outputs: [], outputSizes: [], totalTime: '' };
-	sumInput.classList.add('d-none');
-	sumOutputs.classList.add('d-none');
-	sumEncoding.classList.add('d-none');
-	sumResults.classList.add('d-none');
-	sumComplete.classList.add('d-none');
-	sumTitle.innerHTML = '';
-	sumArtist.textContent = '';
-	sumChips.innerHTML = '';
-	sumOutputList.innerHTML = '';
-	sumBarChart.innerHTML = '';
-	sumTotalTime.textContent = '';
-	sumSpeed.textContent = '--';
-	sumSpeed.className = 'sum-speed-value';
-	sumPosition.textContent = '--';
-	// Reset to summary view
-	currentView = 'summary';
-	document.getElementById('tabSummary').classList.remove('d-none');
-	document.getElementById('tabTerminal').classList.add('d-none');
-	viewToggle.querySelector('i').className = 'bi bi-terminal';
-	viewToggle.title = 'Show terminal';
-}
-
-function badgeClass(fmt) {
-	const f = fmt.toLowerCase();
-	if (f.includes('jpg') || f.includes('jpeg') || f.includes('image')) return 'sum-badge-jpg';
-	if (f.includes('webm')) return 'sum-badge-webm';
-	if (f.includes('mp4')) return 'sum-badge-mp4';
-	return 'sum-badge-default';
-}
-
-function parseFfmpegLine(line) {
-	// Title
-	let m = line.match(/^\s*title\s*:\s*(.+)/);
-	if (m) { summary.title = m[1].trim(); updateSummaryInput(); return; }
-
-	// Artist
-	m = line.match(/^\s*artist\s*:\s*(.+)/);
-	if (m) { summary.artist = m[1].trim(); updateSummaryInput(); return; }
-
-	// Duration
-	m = line.match(/Duration:\s*([\d:.]+)/);
-	if (m) { summary.duration = m[1]; updateSummaryInput(); return; }
-
-	// Video stream (input) - pick the main video stream, not attached pic
-	m = line.match(/Stream #0:\d+.*Video:\s*(\w+).*?,\s*\w+.*?,\s*(\d+)x(\d+).*?,\s*([\d.]+)\s*fps/);
-	if (m) { summary.codec = m[1]; summary.resolution = `${m[2]}x${m[3]}`; summary.fps = m[4]; updateSummaryInput(); return; }
-
-	// Output file
-	m = line.match(/Output #\d+,\s*(\w+),\s*to\s+'.*?\/([\w.]+)'/);
-	if (m) {
-		const rawFmt = m[1].toUpperCase();
-		const name = m[2];
-		const ext = name.split('.').pop().toUpperCase();
-		const fmt = ext || rawFmt;
-		if (!summary.outputs.find(o => o.name === name)) {
-			summary.outputs.push({ fmt, rawFmt, name });
-			updateSummaryOutputs();
+	
+	#id(id) { return document.getElementById(id); }
+	
+	#buildEls() {
+		return {
+			form: this.#id('videoForm'),
+			card: this.#id('mainCard'),
+			logCode: document.querySelector('#log code'),
+			logPre: this.#id('log'),
+			progress: this.#id('progressWrapper'),
+			bar: this.#id('progressBar'),
+			barText: this.#id('progressText'),
+			downloads: this.#id('downloadLinks'),
+			submit: this.#id('submitBtn'),
+			logsToggle: this.#id('logsToggle'),
+			logsText: this.#id('logsToggleText'),
+			dropZone: this.#id('dropZone'),
+			fileInput: this.#id('file'),
+			fileInfo: this.#id('fileInfo'),
+			fileName: this.#id('fileName'),
+			fileSize: this.#id('fileSize'),
+			clearFile: this.#id('clearFile'),
+			sumInput: this.#id('sumInput'),
+			sumTitle: this.#id('sumTitle'),
+			sumArtist: this.#id('sumArtist'),
+			sumChips: this.#id('sumChips'),
+			sumOutputs: this.#id('sumOutputs'),
+			sumOutputList: this.#id('sumOutputList'),
+			sumEncoding: this.#id('sumEncoding'),
+			sumSpeed: this.#id('sumSpeed'),
+			sumPosition: this.#id('sumPosition'),
+			sumResults: this.#id('sumResults'),
+			sumBarChart: this.#id('sumBarChart'),
+			sumComplete: this.#id('sumComplete'),
+			sumTotalTime: this.#id('sumTotalTime'),
+			viewToggle: this.#id('viewToggle'),
+			tabSummary: this.#id('tabSummary'),
+			tabTerminal: this.#id('tabTerminal'),
+		};
+	}
+	
+	#show(el) { el.classList.remove('d-none'); }
+	#hide(el) { el.classList.add('d-none'); }
+	
+	#hideAll(...els) {
+		els.forEach(el => el.classList.add('d-none'));
+	}
+	
+	#makeEl(tag, props = {}, attrs = {}) {
+		const el = document.createElement(tag);
+		Object.assign(el, props);
+		for (const [k, v] of Object.entries(attrs))
+			el.setAttribute(k, v);
+		return el;
+	}
+	
+	#fmtClass(prefix, fmt) {
+		const f = fmt.toLowerCase();
+		const type =
+			f.includes('jpg') || f.includes('jpeg')
+				|| f.includes('image') ? 'jpg'
+			: f.includes('webm') ? 'webm'
+			: f.includes('mp4') ? 'mp4'
+			: 'default';
+		return `${prefix}-${type}`;
+	}
+	
+	// --- State ---
+	
+	#freshSummary() {
+		return {
+			title: '', artist: '', duration: '', durationSec: 0,
+			resolution: '', codec: '', fps: '',
+			outputs: [], outputSizes: [],
+			speed: null, outTime: null, totalTime: '',
+		};
+	}
+	
+	#resetSummary() {
+		this.summary = this.#freshSummary();
+		const e = this.el;
+		this.#hideAll(
+			e.sumInput, e.sumOutputs, e.sumEncoding,
+			e.sumResults, e.sumComplete
+		);
+		e.sumTitle.innerHTML = '';
+		e.sumArtist.textContent = '';
+		e.sumChips.innerHTML = '';
+		e.sumOutputList.innerHTML = '';
+		e.sumBarChart.innerHTML = '';
+		e.sumTotalTime.textContent = '';
+		e.sumSpeed.textContent = '--';
+		e.sumSpeed.className = 'sum-speed-value';
+		e.sumPosition.textContent = '--';
+		this.#setView('summary');
+	}
+	
+	#resetToUpload() {
+		const e = this.el;
+		e.downloads.innerHTML = '';
+		this.#hide(e.progress);
+		this.#resetSummary();
+		e.bar.style.width = '0%';
+		e.barText.textContent = '0%';
+		e.fileInput.value = '';
+		this.#show(e.dropZone);
+		this.#hide(e.fileInfo);
+		this.#hide(e.submit);
+		e.submit.disabled = false;
+		e.clearFile.classList.remove('d-none');
+	}
+	
+	// --- View toggle ---
+	
+	#setView(view) {
+		this.view = view;
+		const sum = view === 'summary';
+		this.el.tabSummary.classList.toggle('d-none', !sum);
+		this.el.tabTerminal.classList.toggle('d-none', sum);
+		const icon = this.el.viewToggle.querySelector('i');
+		icon.className = sum ? 'bi bi-terminal' : 'bi bi-speedometer2';
+		this.el.viewToggle.title = sum ? 'Show terminal' : 'Show summary';
+	}
+	
+	// --- FFmpeg parsing ---
+	
+	#parseLine(line) {
+		for (const [re, tag, fn] of VidTool.PARSE_RULES) {
+			const m = line.match(re);
+			if (m) {
+				fn(this.summary, m);
+				if (tag) this.#refreshUI(tag);
+				return;
+			}
 		}
-		return;
 	}
-
-	// Output file sizes
-	m = line.match(/\[out#\d+\/(\w+)\s.*?video:\s*(\d+)KiB/);
-	if (m) {
-		const fmt = m[1].toUpperCase();
-		const sizeKB = parseInt(m[2], 10);
-		const sizeStr = sizeKB >= 1024 ? `${(sizeKB / 1024).toFixed(1)} MB` : `${sizeKB} KB`;
-		summary.outputSizes.push({ fmt, size: sizeStr });
-		return;
+	
+	#refreshUI(tag) {
+		if (tag === 'input') this.#updateInput();
+		else if (tag === 'outputs') this.#updateOutputs();
+		else if (tag === 'encoding') this.#updateEncoding();
 	}
-
-	// Speed from progress lines (e.g. "speed=0.87x")
-	m = line.match(/^speed=([\d.]+)x/);
-	if (m) { updateSummaryEncoding(m[1] + 'x', null); return; }
-
-	// out_time from progress lines (e.g. "out_time=00:00:12.545867")
-	m = line.match(/^out_time=([\d:.]+)/);
-	if (m && m[1] !== 'N/A') {
-		const durStr = summary.duration || '';
-		const pos = m[1].replace(/\.\d+$/, '');
-		updateSummaryEncoding(null, durStr ? `${pos} / ${durStr}` : pos);
-		return;
+	
+	#parseDuration(dur) {
+		const p = dur.split(':');
+		return p.length === 3
+			? parseFloat(p[0]) * 3600 + parseFloat(p[1]) * 60 + parseFloat(p[2])
+			: 0;
 	}
-
-	// Total processing time
-	m = line.match(/Total processing time:\s*([\d.]+)s/);
-	if (m) { summary.totalTime = m[1]; return; }
-}
-
-function parseDurationToSec(dur) {
-	const parts = dur.split(':');
-	if (parts.length === 3) return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
-	return 0;
-}
-
-function updateSummaryInput() {
-	if (!summary.title && !summary.resolution && !summary.duration) return;
-	sumInput.classList.remove('d-none');
-
-	if (summary.title) {
-		sumTitle.innerHTML = `<span class="sum-quote">\u201C</span>${summary.title}<span class="sum-quote">\u201D</span>`;
-	} else {
-		sumTitle.textContent = 'Untitled';
+	
+	// --- Summary UI updates ---
+	
+	#updateInput() {
+		const s = this.summary;
+		if (!s.title && !s.resolution && !s.duration) return;
+		this.#show(this.el.sumInput);
+		
+		if (s.title) {
+			const q = 'sum-quote fw-light';
+			this.el.sumTitle.innerHTML =
+				`<span class="${q}">\u201C</span>${s.title}`
+				+ `<span class="${q}">\u201D</span>`;
+		} else {
+			this.el.sumTitle.textContent = 'Untitled';
+		}
+		
+		this.el.sumArtist.textContent = s.artist ? `by ${s.artist}` : '';
+		
+		this.el.sumChips.innerHTML = '';
+		const chips = [];
+		if (s.resolution) chips.push(s.resolution);
+		if (s.codec) chips.push(s.codec.toUpperCase());
+		if (s.fps) chips.push(s.fps + ' fps');
+		if (s.duration) chips.push(s.duration);
+		
+		const cls = 'sum-chip d-inline-flex align-items-center fw-medium';
+		for (const text of chips) {
+			this.el.sumChips.appendChild(
+				this.#makeEl('span', { className: cls, textContent: text })
+			);
+		}
+		
+		if (s.duration) s.durationSec = this.#parseDuration(s.duration);
 	}
-	sumArtist.textContent = summary.artist ? `by ${summary.artist}` : '';
-
-	sumChips.innerHTML = '';
-	const chips = [];
-	if (summary.resolution) chips.push(summary.resolution);
-	if (summary.codec) chips.push(summary.codec.toUpperCase());
-	if (summary.fps) chips.push(summary.fps + ' fps');
-	if (summary.duration) chips.push(summary.duration);
-	chips.forEach(text => {
-		const chip = document.createElement('span');
-		chip.className = 'sum-chip';
-		chip.textContent = text;
-		sumChips.appendChild(chip);
-	});
-
-	if (summary.duration) {
-		summary.durationSec = parseDurationToSec(summary.duration);
+	
+	#updateOutputs() {
+		const s = this.summary;
+		if (s.outputs.length === 0) return;
+		this.#show(this.el.sumOutputs);
+		this.el.sumOutputList.innerHTML = '';
+		
+		const base =
+			'sum-badge d-inline-flex align-items-center fw-semibold text-uppercase';
+		for (const o of s.outputs) {
+			const cls = base + ' ' + this.#fmtClass('sum-badge', o.fmt);
+			this.el.sumOutputList.appendChild(
+				this.#makeEl('span', {
+					className: cls, textContent: o.fmt, title: o.name,
+				})
+			);
+		}
 	}
-}
-
-function updateSummaryOutputs() {
-	if (summary.outputs.length === 0) return;
-	sumOutputs.classList.remove('d-none');
-	sumOutputList.innerHTML = '';
-	summary.outputs.forEach(o => {
-		const badge = document.createElement('span');
-		badge.className = `sum-badge ${badgeClass(o.fmt)}`;
-		badge.textContent = o.fmt;
-		badge.title = o.name;
-		sumOutputList.appendChild(badge);
-	});
-}
-
-function updateSummaryEncoding(speed, position) {
-	sumEncoding.classList.remove('d-none');
-	if (speed) {
-		sumSpeed.textContent = speed;
-		const val = parseFloat(speed);
-		sumSpeed.className = 'sum-speed-value' + (val >= 1.0 ? ' speed-fast' : val >= 0.5 ? ' speed-mid' : ' speed-slow');
+	
+	#updateEncoding() {
+		const s = this.summary;
+		this.#show(this.el.sumEncoding);
+		if (s.speed) {
+			this.el.sumSpeed.textContent = s.speed;
+			const val = parseFloat(s.speed);
+			const sc = val >= 1.0 ? ' speed-fast'
+				: val >= 0.5 ? ' speed-mid' : ' speed-slow';
+			this.el.sumSpeed.className = 'sum-speed-value' + sc;
+		}
+		if (s.outTime) this.el.sumPosition.textContent = s.outTime;
 	}
-	if (position) {
-		sumPosition.textContent = position;
+	
+	#showResults() {
+		const s = this.summary;
+		if (!s.outputSizes.length && !s.totalTime) return;
+		
+		if (s.outputSizes.length > 0) {
+			this.#show(this.el.sumResults);
+			this.el.sumBarChart.innerHTML = '';
+			const toKB = (str) => str.includes('MB')
+				? parseFloat(str) * 1024 : parseFloat(str);
+			const maxKB = Math.max(
+				...s.outputSizes.map(o => toKB(o.size))
+			);
+			for (const o of s.outputSizes) {
+				const match = s.outputs.find(
+					x => x.rawFmt === o.fmt || x.fmt === o.fmt
+				);
+				const name = match ? match.name : o.fmt;
+				const fmt = match ? match.fmt : o.fmt;
+				const pct = maxKB > 0 ? (toKB(o.size) / maxKB) * 100 : 0;
+				const fill = this.#fmtClass('sum-bar-fill', fmt);
+				const row = this.#makeEl('div', { className: 'sum-bar-row' });
+				row.innerHTML =
+					`<span class="sum-bar-name text-truncate">${name}</span>`
+					+ '<div class="sum-bar-track">'
+					+ `<div class="sum-bar-fill ${fill}"`
+					+ ` style="width: ${pct}%"></div></div>`
+					+ `<span class="sum-bar-size text-end fw-semibold">`
+					+ `${o.size}</span>`;
+				this.el.sumBarChart.appendChild(row);
+			}
+		}
+		
+		if (s.totalTime) {
+			this.#show(this.el.sumComplete);
+			this.el.sumTotalTime.textContent = `Completed in ${s.totalTime}s`;
+		}
 	}
-}
-
-function barFillClass(fmt) {
-	const f = fmt.toLowerCase();
-	if (f.includes('jpg') || f.includes('jpeg') || f.includes('image')) return 'sum-bar-fill-jpg';
-	if (f.includes('webm')) return 'sum-bar-fill-webm';
-	if (f.includes('mp4')) return 'sum-bar-fill-mp4';
-	return 'sum-bar-fill-default';
-}
-
-function showSummaryResults() {
-	if (summary.outputSizes.length === 0 && !summary.totalTime) return;
-
-	if (summary.outputSizes.length > 0) {
-		sumResults.classList.remove('d-none');
-		sumBarChart.innerHTML = '';
-		const maxKB = Math.max(...summary.outputSizes.map(o => {
-			const s = o.size;
-			return s.includes('MB') ? parseFloat(s) * 1024 : parseFloat(s);
-		}));
-		summary.outputSizes.forEach(o => {
-			const matchingOutput = summary.outputs.find(out => out.rawFmt === o.fmt || out.fmt === o.fmt);
-			const name = matchingOutput ? matchingOutput.name : o.fmt;
-			const fmt = matchingOutput ? matchingOutput.fmt : o.fmt;
-			const sizeKB = o.size.includes('MB') ? parseFloat(o.size) * 1024 : parseFloat(o.size);
-			const pct = maxKB > 0 ? (sizeKB / maxKB) * 100 : 0;
-			const row = document.createElement('div');
-			row.className = 'sum-bar-row';
-			row.innerHTML = `<span class="sum-bar-name">${name}</span><div class="sum-bar-track"><div class="sum-bar-fill ${barFillClass(fmt)}" style="width: ${pct}%"></div></div><span class="sum-bar-size">${o.size}</span>`;
-			sumBarChart.appendChild(row);
+	
+	// --- Prism highlighting ---
+	
+	#highlight() {
+		if (!window.Prism || !Prism.highlightElement) return;
+		if (this.hlPending) return;
+		this.hlPending = true;
+		requestAnimationFrame(() => {
+			try {
+				Prism.highlightElement(this.el.logCode);
+			} finally {
+				const lp = this.el.logPre;
+				if (lp) lp.scrollTop = lp.scrollHeight;
+				this.hlPending = false;
+			}
 		});
 	}
-
-	if (summary.totalTime) {
-		sumComplete.classList.remove('d-none');
-		sumTotalTime.textContent = `Completed in ${summary.totalTime}s`;
-	}
-}
-
-// View toggle (summary <-> terminal)
-viewToggle.addEventListener('click', () => {
-	if (currentView === 'summary') {
-		currentView = 'terminal';
-		document.getElementById('tabSummary').classList.add('d-none');
-		document.getElementById('tabTerminal').classList.remove('d-none');
-		viewToggle.querySelector('i').className = 'bi bi-speedometer2';
-		viewToggle.title = 'Show summary';
-	} else {
-		currentView = 'summary';
-		document.getElementById('tabSummary').classList.remove('d-none');
-		document.getElementById('tabTerminal').classList.add('d-none');
-		viewToggle.querySelector('i').className = 'bi bi-terminal';
-		viewToggle.title = 'Show terminal';
-	}
-});
-
-function show(el) { el.classList.remove('d-none'); }
-function hide(el) { el.classList.add('d-none'); }
-
-// Logs toggle
-logsToggle.addEventListener('click', () => {
-	mainCard.classList.toggle('logs-open');
-	logsToggleText.textContent = mainCard.classList.contains('logs-open') ? 'Hide logs' : 'Show logs';
-});
-
-// Drop zone click opens file picker
-dropZone.addEventListener('click', () => fileInput.click());
-
-// Drag and drop
-dropZone.addEventListener('dragover', (e) => {
-	e.preventDefault();
-	dropZone.classList.add('drag-over');
-});
-dropZone.addEventListener('dragleave', () => {
-	dropZone.classList.remove('drag-over');
-});
-dropZone.addEventListener('drop', (e) => {
-	e.preventDefault();
-	dropZone.classList.remove('drag-over');
-	const file = e.dataTransfer.files[0];
-	if (file && file.type.startsWith('video/')) {
-		setFile(file);
-	}
-});
-
-// File input change
-fileInput.addEventListener('change', () => {
-	if (fileInput.files.length > 0) {
-		setFile(fileInput.files[0]);
-	}
-});
-
-// Clear file
-clearFile.addEventListener('click', () => {
-	fileInput.value = '';
-	show(dropZone);
-	hide(fileInfo);
-	hide(submitBtn);
-});
-
-function setFile(file) {
-	if (fileInput.files.length === 0 || fileInput.files[0] !== file) {
-		const dt = new DataTransfer();
-		dt.items.add(file);
-		fileInput.files = dt.files;
-	}
-	fileName.textContent = file.name;
-	fileSize.textContent = `(${(file.size / (1024 * 1024)).toFixed(1)} MB)`;
-	hide(dropZone);
-	show(fileInfo);
-	show(submitBtn);
-}
-
-function resetToUploadState() {
-	downloadLinks.innerHTML = '';
-	hide(progressWrapper);
-	resetSummary();
-	progressBar.style.width = '0%';
-	progressText.textContent = '0%';
-	fileInput.value = '';
-	show(dropZone);
-	hide(fileInfo);
-	hide(submitBtn);
-	submitBtn.disabled = false;
-	clearFile.classList.remove('d-none');
-}
-
-let highlightPending = false;
-function schedulePrismHighlight() {
-	if (!window.Prism || !Prism.highlightElement) return;
-	if (highlightPending) return;
-	highlightPending = true;
-	requestAnimationFrame(() => {
-		try {
-			Prism.highlightElement(logDiv);
-		} finally {
-			if (logPre) logPre.scrollTop = logPre.scrollHeight;
-			highlightPending = false;
+	
+	// --- File handling ---
+	
+	#setFile(file) {
+		const e = this.el;
+		if (e.fileInput.files.length === 0 || e.fileInput.files[0] !== file) {
+			const dt = new DataTransfer();
+			dt.items.add(file);
+			e.fileInput.files = dt.files;
 		}
-	});
-}
-
-form.addEventListener('submit', async (e) => {
-	e.preventDefault();
-
-	logDiv.textContent = '';
-	downloadLinks.innerHTML = '';
-	show(progressWrapper);
-	progressBar.style.width = '0%';
-	progressText.textContent = '0%';
-	progressBar.classList.add('progress-bar-animated');
-	submitBtn.disabled = true;
-	logsToggle.style.display = 'block';
-	logsToggleText.textContent = 'Hide logs';
-	mainCard.classList.add('logs-open');
-	resetSummary();
-	schedulePrismHighlight();
-
-	const formData = new FormData(form);
-
-	let response;
-	try {
-		response = await fetch(form.action, { method: 'POST', body: formData });
-	} catch (err) {
-		logDiv.textContent += `Network error: ${err}\n`;
-		submitBtn.disabled = false;
-		return;
+		e.fileName.textContent = file.name;
+		const mb = (file.size / (1024 * 1024)).toFixed(1);
+		e.fileSize.textContent = `(${mb} MB)`;
+		this.#hide(e.dropZone);
+		this.#show(e.fileInfo);
+		this.#show(e.submit);
 	}
-
-	if (!response.ok) {
-		logDiv.textContent += `HTTP error: ${response.status} ${response.statusText}\n`;
-		submitBtn.disabled = false;
-		return;
+	
+	// --- Upload & streaming ---
+	
+	#prepareUI() {
+		const e = this.el;
+		e.logCode.textContent = '';
+		e.downloads.innerHTML = '';
+		this.#show(e.progress);
+		e.bar.style.width = '0%';
+		e.barText.textContent = '0%';
+		e.bar.classList.add('progress-bar-animated');
+		e.submit.disabled = true;
+		e.logsToggle.style.display = 'block';
+		e.logsText.textContent = 'Hide logs';
+		e.card.classList.add('logs-open');
+		this.#resetSummary();
+		this.#highlight();
 	}
-
-	if (!response.body) {
-		logDiv.textContent = 'Streaming not supported in this browser.';
-		submitBtn.disabled = false;
-		return;
-	}
-
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder('utf-8');
-	let buffer = '';
-	let totalDuration = 0;
-
-	const processLine = (line) => {
-		if (!line) return;
-		if (line.charCodeAt(0) === 0x1E) line = line.slice(1);
-
+	
+	async #upload() {
+		const data = new FormData(this.el.form);
 		try {
-			const data = JSON.parse(line);
-			switch (data.type) {
-				case 'log': {
-					logDiv.textContent += data.line + '\n';
-					parseFfmpegLine(data.line);
-					schedulePrismHighlight();
-					break;
-				}
-				case 'duration': {
-					totalDuration = Number(data.value) || 0;
-					break;
-				}
-				case 'progress': {
-					let percent = null;
-					if (typeof data.percent === 'number' && !Number.isNaN(data.percent)) {
-						percent = Math.round(Math.max(0, Math.min(100, data.percent)));
-					} else if (totalDuration > 0 && typeof data.time !== 'undefined') {
-						percent = Math.min(100, Math.round((Number(data.time) / totalDuration) * 100));
-					}
-					if (percent !== null) {
-						progressBar.style.width = percent + '%';
-						progressText.textContent = percent + '%';
-					}
-					break;
-				}
-				case 'done': {
-					logDiv.textContent += 'Processing complete.\n';
-					hide(submitBtn);
-					clearFile.classList.add('d-none');
-					showSummaryResults();
-
-					if (data.links) {
-						const dropdown = document.createElement('div');
-						dropdown.className = 'dropdown';
-
-						const btn = document.createElement('button');
-						btn.className = 'btn btn-primary btn-lg w-100 py-3 dropdown-toggle';
-						btn.type = 'button';
-						btn.setAttribute('data-bs-toggle', 'dropdown');
-						btn.setAttribute('aria-expanded', 'false');
-						btn.innerHTML = '<i class="bi bi-download me-2"></i>Download';
-						dropdown.appendChild(btn);
-
-						const menu = document.createElement('ul');
-						menu.className = 'dropdown-menu w-100';
-
-						const fileLinks = [];
-						data.links.forEach(linkObj => {
-							const li = document.createElement('li');
-							const a = document.createElement('a');
-							a.className = 'dropdown-item';
-							a.href = linkObj.url;
-							a.download = linkObj.name;
-							a.textContent = linkObj.name;
-							li.appendChild(a);
-							menu.appendChild(li);
-							fileLinks.push(a);
-						});
-
-						const divider = document.createElement('li');
-						divider.innerHTML = '<hr class="dropdown-divider">';
-						menu.appendChild(divider);
-
-						const allLi = document.createElement('li');
-						const allLink = document.createElement('a');
-						allLink.className = 'dropdown-item';
-						allLink.href = '#';
-						allLink.innerHTML = '<i class="bi bi-collection me-2"></i>All';
-						allLink.addEventListener('click', (e) => {
-							e.preventDefault();
-							fileLinks.forEach((link, i) => setTimeout(() => link.click(), i * 200));
-						});
-						allLi.appendChild(allLink);
-						menu.appendChild(allLi);
-
-						dropdown.appendChild(menu);
-						downloadLinks.appendChild(dropdown);
-
-						const newUploadLink = document.createElement('a');
-						newUploadLink.href = '#';
-						newUploadLink.className = 'small text-muted d-block text-center mt-3';
-						newUploadLink.innerHTML = '<i class="bi bi-arrow-repeat me-1"></i>Upload another video';
-						newUploadLink.addEventListener('click', (e) => {
-							e.preventDefault();
-							resetToUploadState();
-						});
-						downloadLinks.appendChild(newUploadLink);
-					}
-
-					progressBar.style.width = '100%';
-					progressText.textContent = '100%';
-					progressBar.classList.remove('progress-bar-animated');
-					break;
-				}
-				case 'error': {
-					logDiv.textContent += 'Error: ' + data.message + '\n';
-					progressBar.classList.remove('progress-bar-animated');
-					submitBtn.disabled = false;
-					break;
-				}
-				default: {
-					logDiv.textContent += line + '\n';
-				}
+			const res = await fetch(
+				this.el.form.action, { method: 'POST', body: data }
+			);
+			if (!res.ok) {
+				this.el.logCode.textContent +=
+					`HTTP error: ${res.status} ${res.statusText}\n`;
+				this.el.submit.disabled = false;
+				return null;
 			}
-		} catch (e) {
-			logDiv.textContent += line + '\n';
-		}
-	};
-
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) {
-			if (buffer.trim()) processLine(buffer.trim());
-			break;
-		}
-		buffer += decoder.decode(value, { stream: true });
-		const parts = buffer.split(/\r?\n/);
-		buffer = parts.pop();
-		for (const part of parts) {
-			const line = part.trim();
-			if (line) processLine(line);
+			if (!res.body) {
+				this.el.logCode.textContent = 'Streaming not supported.\n';
+				this.el.submit.disabled = false;
+				return null;
+			}
+			return res;
+		} catch (err) {
+			this.el.logCode.textContent += `Network error: ${err}\n`;
+			this.el.submit.disabled = false;
+			return null;
 		}
 	}
-});
+	
+	async #streamResponse(res) {
+		const reader = res.body.getReader();
+		const decoder = new TextDecoder('utf-8');
+		let buffer = '';
+		this.duration = 0;
+		
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) {
+				if (buffer.trim()) this.#processLine(buffer.trim());
+				break;
+			}
+			buffer += decoder.decode(value, { stream: true });
+			const parts = buffer.split(/\r?\n/);
+			buffer = parts.pop();
+			for (const part of parts) {
+				const line = part.trim();
+				if (line) this.#processLine(line);
+			}
+		}
+	}
+	
+	#processLine(line) {
+		if (line.charCodeAt(0) === 0x1E) line = line.slice(1);
+		try {
+			this.#processMessage(JSON.parse(line), line);
+		} catch {
+			this.el.logCode.textContent += line + '\n';
+		}
+	}
+	
+	#processMessage(data, raw) {
+		const e = this.el;
+		switch (data.type) {
+			case 'log':
+				e.logCode.textContent += data.line + '\n';
+				this.#parseLine(data.line);
+				this.#highlight();
+				break;
+			case 'duration':
+				this.duration = Number(data.value) || 0;
+				break;
+			case 'progress':
+				this.#updateProgress(data);
+				break;
+			case 'done':
+				this.#handleDone(data);
+				break;
+			case 'error':
+				e.logCode.textContent += 'Error: ' + data.message + '\n';
+				e.bar.classList.remove('progress-bar-animated');
+				e.submit.disabled = false;
+				break;
+			default:
+				e.logCode.textContent += raw + '\n';
+		}
+	}
+	
+	#updateProgress(data) {
+		let pct = null;
+		if (typeof data.percent === 'number' && !Number.isNaN(data.percent)) {
+			pct = Math.round(Math.max(0, Math.min(100, data.percent)));
+		} else if (this.duration > 0 && data.time !== undefined) {
+			pct = Math.min(100,
+				Math.round((Number(data.time) / this.duration) * 100));
+		}
+		if (pct !== null) {
+			this.el.bar.style.width = pct + '%';
+			this.el.barText.textContent = pct + '%';
+		}
+	}
+	
+	#handleDone(data) {
+		const e = this.el;
+		e.logCode.textContent += 'Processing complete.\n';
+		this.#hide(e.submit);
+		e.clearFile.classList.add('d-none');
+		this.#showResults();
+		if (data.links) this.#buildDownloads(data.links);
+		e.bar.style.width = '100%';
+		e.barText.textContent = '100%';
+		e.bar.classList.remove('progress-bar-animated');
+	}
+	
+	#buildDownloads(links) {
+		const e = this.el;
+		const dropdown = this.#makeEl('div', { className: 'dropdown' });
+		const btn = this.#makeEl('button', {
+			className: 'btn btn-primary btn-lg w-100 py-3 dropdown-toggle',
+			type: 'button',
+			innerHTML: '<i class="bi bi-download me-2"></i>Download',
+		}, {
+			'data-bs-toggle': 'dropdown',
+			'aria-expanded': 'false',
+		});
+		dropdown.appendChild(btn);
+		
+		const menu = this.#makeEl('ul', { className: 'dropdown-menu w-100' });
+		const fileLinks = [];
+		
+		for (const link of links) {
+			const li = this.#makeEl('li');
+			const a = this.#makeEl('a', {
+				className: 'dropdown-item',
+				href: link.url, download: link.name, textContent: link.name,
+			});
+			li.appendChild(a);
+			menu.appendChild(li);
+			fileLinks.push(a);
+		}
+		
+		const divider = this.#makeEl('li');
+		divider.innerHTML = '<hr class="dropdown-divider">';
+		menu.appendChild(divider);
+		
+		const allLi = this.#makeEl('li');
+		const allLink = this.#makeEl('a', {
+			className: 'dropdown-item',
+			href: '#',
+			innerHTML: '<i class="bi bi-collection me-2"></i>All',
+		});
+		allLink.addEventListener('click', (ev) => {
+			ev.preventDefault();
+			fileLinks.forEach((a, i) => setTimeout(() => a.click(), i * 200));
+		});
+		allLi.appendChild(allLink);
+		menu.appendChild(allLi);
+		dropdown.appendChild(menu);
+		e.downloads.appendChild(dropdown);
+		
+		const again = this.#makeEl('a', {
+			href: '#',
+			className: 'small text-muted d-block text-center mt-3',
+			innerHTML:
+				'<i class="bi bi-arrow-repeat me-1"></i>Upload another video',
+		});
+		again.addEventListener('click', (ev) => {
+			ev.preventDefault();
+			this.#resetToUpload();
+		});
+		e.downloads.appendChild(again);
+	}
+	
+	// --- Event binding ---
+	
+	#bind() {
+		const e = this.el;
+		
+		e.form.addEventListener('submit', (ev) => this.#handleSubmit(ev));
+		e.dropZone.addEventListener('click', () => e.fileInput.click());
+		
+		e.dropZone.addEventListener('dragover', (ev) => {
+			ev.preventDefault();
+			e.dropZone.classList.add('drag-over');
+		});
+		
+		e.dropZone.addEventListener('dragleave',
+			() => e.dropZone.classList.remove('drag-over'));
+			
+		e.dropZone.addEventListener('drop', (ev) => {
+			ev.preventDefault();
+			e.dropZone.classList.remove('drag-over');
+			const f = ev.dataTransfer.files[0];
+			if (f && f.type.startsWith('video/')) this.#setFile(f);
+		});
+		
+		e.fileInput.addEventListener('change', () => {
+			if (e.fileInput.files.length > 0)
+				this.#setFile(e.fileInput.files[0]);
+		});
+		
+		e.clearFile.addEventListener('click', () => {
+			e.fileInput.value = '';
+			this.#show(e.dropZone);
+			this.#hide(e.fileInfo);
+			this.#hide(e.submit);
+		});
+		
+		e.viewToggle.addEventListener('click', () => {
+			this.#setView(
+				this.view === 'summary' ? 'terminal' : 'summary'
+			);
+		});
+		
+		e.logsToggle.addEventListener('click', () => {
+			e.card.classList.toggle('logs-open');
+			e.logsText.textContent =
+				e.card.classList.contains('logs-open')
+					? 'Hide logs' : 'Show logs';
+		});
+	}
+	
+	async #handleSubmit(ev) {
+		ev.preventDefault();
+		this.#prepareUI();
+		const res = await this.#upload();
+		if (res) await this.#streamResponse(res);
+	}
+}
+
+new VidTool();
